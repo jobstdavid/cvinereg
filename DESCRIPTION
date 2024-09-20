@@ -1,0 +1,37 @@
+Package: cvinereg
+Type: Package
+Title: C-Vine Quantile Regression
+Version: 0.1.0
+Authors@R: c(
+        person("David", "Jobst",, "jobstd@uni-hildesheim.de", role = c("aut", "cre")),
+        person("Thomas", "Nagler",, "mail@tnagler.com", role = c("ctb"))
+        )
+Maintainer: David Jobst <jobstd@uni-hildesheim.de>
+Description: 
+  Implements C-vine quantile regression models with
+  parametric or nonparametric pair-copulas. See 
+  Tepegjozova and Czado (2019) <https://mediatum.ub.tum.de/doc/1536070/1536070.pdf> and
+  Tepegjozova et al. (2022) <https://doi.org/10.1515/demo-2022-0100>.
+License: GPL-3
+Imports: 
+  rvinecopulib (>= 0.6.1.1.2), 
+  kde1d (>= 1.0.2),
+  Rcpp,
+  assertthat
+LinkingTo: 
+  rvinecopulib, 
+  RcppEigen, 
+  Rcpp, 
+  BH,
+  wdm,
+  RcppThread, 
+  kde1d
+Suggests:
+  knitr,
+  rmarkdown,
+  ggplot2
+RoxygenNote: 7.3.2
+Roxygen: list(markdown = TRUE)
+URL: https://github.com/jobstdavid/cvinereg/
+BugReports: https://github.com/jobstdavid/cvinereg/issues
+Encoding: UTF-8

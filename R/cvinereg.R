@@ -1,0 +1,268 @@
+#' C-vine regression models
+#'
+#' Sequential estimation of a regression C-vine for the purpose of quantile
+#' prediction as described in Tepegjozova and Czado (2019) and Tepegjozova et al. (2022).
+#'
+#' @details
+#' Note, that currently only continuous variables for the C-vine regression models are supported.
+#' Furthermore, the code is heavily based on the one of the R-package \code{vinereg}, htpps://doi.org/10.32614/CRAN.package.vinereg.
+#'
+#' @param formula an object of class "formula"; same as [lm()].
+#' @param data data frame (or object coercible by [as.data.frame()]) containing
+#'   the variables in the model.
+#' @param family_set see `family_set` argument of [rvinecopulib::bicop()].
+#' @param selcrit selection criterion based on conditional log-likelihood.
+#'   \code{"loglik"} (default) imposes no correction; other choices are
+#'   \code{"aic"} and \code{"bic"}.
+#' @param order the order of covariates in the C-vine, provided as vector of
+#'   variable names (after calling
+#'   `cvinereg:::expand_factors(model.frame(formula, data))`); selected
+#'   automatically if `order = NA` (default).
+#' @param par_1d list of options passed to [kde1d::kde1d()], must be one value
+#'   for each margin, e.g. `list(xmin = c(0, 0, NaN))` if the response and first
+#'   covariate have non-negative support.
+#' @param weights optional vector of weights for each observation.
+#' @param cores integer; the number of cores to use for computations.
+#' @param ... further arguments passed to [rvinecopulib::bicop()].
+#' @param uscale if TRUE, vinereg assumes that marginal distributions have been
+#'   taken care of in a preliminary step.
+#'
+#' @return An object of class cvinereg. It is a list containing the elements
+#'   \describe{
+#'   \item{formula}{the formula used for the fit.}
+#'   \item{selcrit}{criterion used for variable selection.}
+#'   \item{model_frame}{the data used to fit the regression model.}
+#'   \item{margins}{list of marginal models fitted by [kde1d::kde1d()].}
+#'   \item{vine}{an [rvinecopulib::vinecop_dist()] object containing the fitted
+#'   C-vine.}
+#'   \item{stats}{fit statistics such as conditional
+#'   log-likelihood/AIC/BIC and p-values for each variable's contribution.}
+#'   \item{order}{order of the covariates chosen by the variable selection
+#'   algorithm.}
+#'   \item{selected_vars}{indices of selected variables.}}
+#'   Use [predict.cvinereg()] to predict conditional quantiles. `summary.cvinereg()`
+#'   shows the contribution of each selected variable with the associated
+#'   p-value derived from a likelihood ratio test.
+#'
+#' @references
+#' Tepegjozova and Czado (2019), D- and C-vine quantile regression for large data sets,
+#' https://mediatum.ub.tum.de/doc/1536070/1536070.pdf.
+#'
+#' Tepegjozova et al. (2022). Nonparametric C- and D-vine-based quantile regression,
+#' Dependence Modeling, 10(1), 1-21, https://doi.org/10.1515/demo-2022-0100.
+#'
+#' @examples
+#' # simulate data
+#' x <- matrix(rnorm(200), 100, 2)
+#' y <- x %*% c(1, -2)
+#' data <- data.frame(y = y, x = x)
+#'
+#' # fit vine regression model
+#' fit <- cvinereg(y ~ ., data)
+#'
+#' # model predictions
+#' mu_hat <- predict(fit, newdata = data, alpha = NA) # mean
+#' med_hat <- predict(fit, newdata = data, alpha = 0.5) # median
+#'
+#' @seealso \code{\link{predict.cvinereg}}
+#'
+#' @export
+#'
+#' @importFrom kde1d kde1d pkde1d
+#' @importFrom stats model.frame logLik
+#' @importFrom utils modifyList
+#' @importFrom rvinecopulib bicop vinecop cvine_structure
+#' @importFrom Rcpp sourceCpp
+#' @useDynLib cvinereg, .registration = TRUE
+cvinereg <- function(formula, data, family_set = "parametric", selcrit = "aic",
+                     order = NA, par_1d = list(), weights = numeric(),
+                     cores = 1, ..., uscale = FALSE) {
+  # remove unused variables
+  if (!missing(data)) {
+    mf <- model.frame(formula, data)
+  } else {
+    mf <- model.frame(formula, parent.frame())
+  }
+  if (!(is.ordered(mf[[1]]) | is.numeric(mf[[1]])))
+    stop("response must be numeric or ordered")
+  if (any(sapply(mf, is.factor)) && uscale)
+    stop("factors are not allowed with uscale = TRUE")
+
+  # expand factors and deduce variable types
+  mfx <- expand_factors(mf)
+  d <- ncol(mfx)
+  var_types <- rep("c", d)
+  # support currently only continuous variables
+  # var_types[sapply(mfx, is.ordered)] <- "d"
+
+  ## prepare fit controls (little hack calling bicop() for all checks)
+  arg <- list(
+    data = t(c(0.5, 0.5)),
+    family_set = family_set,
+    selcrit = selcrit,
+    cores = cores,
+    par_method = "mle",
+    nonpar_method = "quadratic",
+    mult = 1,
+    psi0 = 0.9,
+    presel = TRUE,
+    keep_data = FALSE
+  )
+  ctrl <- do.call(
+    bicop,
+    modifyList(arg, list(...))
+  )$controls
+  ctrl$weights <- numeric()
+
+  if (!all(is.na(order))) {
+    check_order(order, names(mfx))
+
+    selected_vars <- which(names(mfx) %in% order)
+    var_types <- var_types[c(1, selected_vars)]
+    mfx <- mfx[, c(1, selected_vars)]
+
+    if (!uscale) {
+      par_1d <- process_par_1d(mfx, par_1d)
+      margins <- fit_margins_cpp(prep_for_kde1d(mfx),
+                                 sapply(mfx, nlevels),
+                                 mult = par_1d$mult,
+                                 xmin = par_1d$xmin,
+                                 xmax = par_1d$xmax,
+                                 bw = par_1d$bw,
+                                 deg = par_1d$deg,
+                                 weights = weights,
+                                 cores)
+      margins <- finalize_margins(margins, mfx)
+      u <- to_uscale(mfx, margins)
+    } else {
+      margins <- lapply(1:d, function(x) list(edf = NA, loglik = NA))
+      u <- as.matrix(mfx)
+    }
+
+    # now we need the correct ordering in selected_vars
+    selected_vars <- sapply(order, function(x) which(x == names(mfx)))
+    args <- modifyList(
+      ctrl,
+      list(
+        data = u,
+        var_types = var_types,
+        cores = cores,
+        weights = weights,
+        structure = cvine_structure(rev(rank(c(selected_vars, 1))))
+      )
+    )
+    fit <- list(
+      vine = do.call(vinecop, args),
+      selected_vars = selected_vars
+    )
+  } else {
+    if (!uscale) {
+      par_1d <- process_par_1d(mfx, par_1d)
+      margins <- fit_margins_cpp(prep_for_kde1d(mfx),
+                                 sapply(mfx, nlevels),
+                                 mult = par_1d$mult,
+                                 xmin = par_1d$xmin,
+                                 xmax = par_1d$xmax,
+                                 bw = par_1d$bw,
+                                 deg = par_1d$deg,
+                                 weights = weights,
+                                 cores)
+      margins <- finalize_margins(margins, mfx)
+      u <- to_uscale(mfx, margins)
+    }  else {
+      margins <- lapply(1:d, function(x) list(edf = NA, loglik = NA))
+      u <- as.matrix(mfx)
+    }
+
+    args <- modifyList(
+      ctrl,
+      list(data = u, var_types = var_types, cores = cores, weights = weights)
+    )
+    fit <- do.call(select_cvine_cpp, args)
+    if (!uscale)
+      margins <- margins[c(1, sort(fit$selected_vars))] # other margins useless
+  }
+
+  finalize_vinereg_object(
+    formula = formula,
+    selcrit = selcrit,
+    model_frame = mf,
+    margins = margins,
+    vine = fit$vine,
+    selected_vars = fit$selected_vars,
+    var_nms = colnames(mfx)
+  )
+
+
+}
+
+#' @noRd
+#' @importFrom stats pchisq
+#' @importFrom rvinecopulib as_rvine_structure
+finalize_vinereg_object <- function(formula, selcrit, model_frame, margins, vine,
+                                    selected_vars, var_nms) {
+  vine$names <- c(var_nms[1], var_nms[sort(selected_vars)])
+  nobs <- nrow(model_frame)
+  vine$nobs <- nobs
+  var_edf <- c(
+    margins[[1]]$edf,
+    vapply(vine$pair_copulas, function(pcs) pcs[[1]]$npars, numeric(1))
+  )
+  var_cll <- c(
+    margins[[1]]$loglik,
+    vapply(vine$pair_copulas, function(pcs) pcs[[1]]$loglik, numeric(1))
+  )
+
+  var_caic <- -2 * var_cll + 2 * var_edf
+  var_cbic <- -2 * var_cll + log(nobs) * var_edf
+  var_p_value <- suppressWarnings(
+    pchisq(2 * var_cll, var_edf, lower.tail = FALSE)
+  )
+  var_p_value[1] <- NA
+  cll <- sum(var_cll, na.rm = TRUE)
+  edf <- sum(var_edf, na.rm = TRUE)
+  caic <- sum(var_caic, na.rm = TRUE)
+  cbic <- sum(var_cbic, na.rm = TRUE)
+
+  stats <- list(
+    nobs = nobs,
+    edf = edf,
+    cll = cll,
+    caic = caic,
+    cbic = cbic,
+    var_edf = var_edf,
+    var_cll = var_cll,
+    var_caic = var_caic,
+    var_cbic = var_cbic,
+    var_p_value = var_p_value
+  )
+
+  out <- list(
+    formula = formula,
+    selcrit = selcrit,
+    model_frame = model_frame,
+    margins = margins,
+    vine = vine,
+    stats = stats,
+    order = var_nms[selected_vars],
+    selected_vars = selected_vars
+  )
+  class(out) <- "cvinereg"
+  out
+}
+
+check_order <- function(order, var_nms) {
+  stopifnot(length(order) > 0)
+  if (!all(order %in% var_nms)) {
+    stop(
+      "unknown variable name in 'order'; ",
+      "allowed values: '", paste(var_nms[-1], collapse = "', '"), "'."
+    )
+  }
+  if (any(order == var_nms[1])) {
+    stop(
+      "response variable '", var_nms[1],
+      "' must not appear in 'order'."
+    )
+  }
+}
